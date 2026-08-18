@@ -1,0 +1,5 @@
+flask
+opencv-python
+numpy
+# opsional, hanya jika USE_YOLO = True
+# ultralytics

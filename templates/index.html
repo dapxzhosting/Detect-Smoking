@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deteksi Merokok - Kamera</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #0f1115;
+    color: #f0f0f0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 12px;
+  }
+  h1 { margin-bottom: 4px; font-size: 22px; text-align: center; }
+  .mode-badge {
+    background: #2c2f38;
+    color: #9fd8ff;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    margin-bottom: 16px;
+  }
+  .video-wrap {
+    position: relative;
+    border: 3px solid #2c2f38;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    width: 100%;
+    max-width: 480px;
+  }
+  video, canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .video-wrap.mirror {
+    transform: scaleX(-1);
+  }
+  #soundToggle {
+    margin-top: 10px;
+    padding: 8px 16px;
+    font-size: 14px;
+    border: 1px solid #333;
+    border-radius: 8px;
+    background: #1c1f26;
+    color: #f0f0f0;
+    cursor: pointer;
+  }
+  #soundToggle.active {
+    background: #2a4d2a;
+    border-color: #4caf50;
+  }
+  canvas#overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+  }
+  .status-box {
+    margin-top: 20px;
+    padding: 14px 24px;
+    border-radius: 10px;
+    font-size: 18px;
+    font-weight: bold;
+    text-align: center;
+    min-width: 260px;
+    max-width: 480px;
+    width: 100%;
+    transition: background 0.3s ease;
+  }
+  .status-normal { background: #1e3a2a; color: #7CFC9A; }
+  .status-alert { background: #3a1e1e; color: #ff6b6b; animation: pulse 1s infinite; }
+  @keyframes pulse {
+    0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; }
+  }
+  .confidence { font-size: 13px; font-weight: normal; opacity: 0.8; display: block; margin-top: 4px; }
+  .note {
+    margin-top: 20px;
+    max-width: 480px;
+    font-size: 13px;
+    color: #9aa0aa;
+    line-height: 1.5;
+  }
+  #startBtn {
+    margin-top: 16px;
+    padding: 12px 28px;
+    font-size: 16px;
+    border: none;
+    border-radius: 8px;
+    background: #4a7dff;
+    color: white;
+    cursor: pointer;
+  }
+  #camSelect {
+    margin-top: 10px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: #1c1f26;
+    color: #f0f0f0;
+    border: 1px solid #333;
+  }
+  #errorBox {
+    margin-top: 16px;
+    color: #ff6b6b;
+    font-size: 14px;
+    max-width: 480px;
+    text-align: center;
+    display: none;
+  }
+</style>
+</head>
+<body>
+  <h1>Stop Rokok YGY</h1>
+  <div class="mode-badge">Mode aktif: {{ mode }}</div>
+
+  <select id="camSelect"></select>
+  <button id="startBtn">Aktifkan Kamera</button>
+  <button id="soundToggle" class="active">🔊 Suara: Aktif</button>
+
+  <div id="errorBox"></div>
+
+  <div class="video-wrap" style="display:none;" id="videoWrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="statusBox" class="status-box status-normal" style="display:none;">
+    Status: Normal
+    <span id="confidence" class="confidence"></span>
+  </div>
+
+  <div class="note">
+    <strong>Catatan:</strong> Kamera diakses langsung dari browser (HP/laptop kamu).
+    Setiap ±700ms, satu frame dikirim ke server untuk dideteksi memakai model Roboflow.
+    Pastikan mengakses via HTTPS atau dari jaringan lokal — beberapa browser memblokir
+    akses kamera di halaman HTTP non-localhost.
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const ctx = overlay.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const camSelect = document.getElementById('camSelect');
+    const videoWrap = document.getElementById('videoWrap');
+    const statusBox = document.getElementById('statusBox');
+    const confidenceEl = document.getElementById('confidence');
+    const errorBox = document.getElementById('errorBox');
+
+    let stream = null;
+    let sending = false;
+    let captureCanvas = document.createElement('canvas');
+    const videoWrapEl = document.getElementById('videoWrap');
+    const soundToggle = document.getElementById('soundToggle');
+
+    let soundEnabled = true;
+    let wasSmoking = false;
+    let lastSpokenAt = 0;
+
+    soundToggle.addEventListener('click', () => {
+      soundEnabled = !soundEnabled;
+      soundToggle.classList.toggle('active', soundEnabled);
+      soundToggle.innerText = soundEnabled ? '🔊 Suara: Aktif' : '🔇 Suara: Mati';
+      if (soundEnabled) {
+        // "Bangunkan" speech synthesis di beberapa browser mobile yang butuh interaksi user
+        speakAlert();
+      }
+    });
+
+    function speakAlert() {
+      if (!soundEnabled) return;
+      if (!('speechSynthesis' in window)) return;
+
+      const now = Date.now();
+      if (now - lastSpokenAt < 4000) return; // jangan spam, jeda minimal 4 detik
+      lastSpokenAt = now;
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance('Terdeteksi sedang merokok');
+      utterance.lang = 'id-ID';
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    function showError(msg) {
+      errorBox.style.display = 'block';
+      errorBox.innerText = msg;
+    }
+
+    async function listCameras() {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === 'videoinput');
+        camSelect.innerHTML = '';
+        cams.forEach((cam, i) => {
+          const opt = document.createElement('option');
+          opt.value = cam.deviceId;
+          opt.text = cam.label || `Kamera ${i + 1}`;
+          camSelect.appendChild(opt);
+        });
+      } catch (e) {
+        console.warn('Tidak bisa list kamera sebelum izin diberikan:', e);
+      }
+    }
+
+    async function startCamera() {
+      errorBox.style.display = 'none';
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showError('Browser ini tidak mendukung akses kamera (getUserMedia). Coba Chrome/Firefox terbaru, dan pastikan halaman diakses via HTTPS atau localhost.');
+        return;
+      }
+
+      const deviceId = camSelect.value;
+      const constraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId } }
+          : { facingMode: { ideal: 'environment' } }, // prefer kamera belakang di HP
+        audio: false
+      };
+
+      try {
+        if (stream) {
+          stream.getTracks().forEach(t => t.stop());
+        }
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+
+        // Deteksi apakah kamera yang aktif adalah kamera depan (user-facing) -> mirror preview-nya
+        const track = stream.getVideoTracks()[0];
+        const settings = track.getSettings ? track.getSettings() : {};
+        const isFrontCamera = settings.facingMode === 'user' ||
+          (camSelect.selectedOptions[0] && /front|depan|user/i.test(camSelect.selectedOptions[0].text));
+        videoWrapEl.classList.toggle('mirror', !!isFrontCamera);
+
+        await new Promise(res => { video.onloadedmetadata = res; });
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        captureCanvas.width = video.videoWidth;
+        captureCanvas.height = video.videoHeight;
+
+        videoWrap.style.display = 'block';
+        statusBox.style.display = 'block';
+        startBtn.innerText = 'Ganti Kamera / Mulai Ulang';
+
+        await listCameras();
+        loopDetect();
+      } catch (e) {
+        console.error(e);
+        showError('Gagal mengakses kamera: ' + e.message + '. Pastikan sudah memberi izin kamera, dan halaman diakses via HTTPS atau alamat lokal (localhost / IP jaringan lokal).');
+      }
+    }
+
+    function drawBoxes(boxes, scaleX, scaleY) {
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      boxes.forEach(b => {
+        const isCig = b.class.toLowerCase().includes('cigar') || b.class.toLowerCase().includes('smok');
+        ctx.strokeStyle = isCig ? '#ff2d2d' : '#00c853';
+        ctx.lineWidth = 3;
+        const x1 = b.x1 * scaleX, y1 = b.y1 * scaleY;
+        const x2 = b.x2 * scaleX, y2 = b.y2 * scaleY;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.fillStyle = isCig ? '#ff2d2d' : '#00c853';
+        ctx.font = '14px sans-serif';
+        ctx.fillText(`${b.class} ${b.conf}`, x1, Math.max(y1 - 6, 12));
+      });
+    }
+
+    async function loopDetect() {
+      if (!stream) return;
+      if (sending) {
+        requestAnimationFrame(() => setTimeout(loopDetect, 700));
+        return;
+      }
+      sending = true;
+
+      try {
+        const cctx = captureCanvas.getContext('2d');
+        cctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+        const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.7);
+
+        const res = await fetch('/detect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: dataUrl })
+        });
+        const data = await res.json();
+
+        if (data.boxes) {
+          const scaleX = overlay.width / (data.image_width || overlay.width);
+          const scaleY = overlay.height / (data.image_height || overlay.height);
+          drawBoxes(data.boxes, scaleX, scaleY);
+        }
+
+        if (data.smoking_detected) {
+          statusBox.className = 'status-box status-alert';
+          statusBox.innerHTML = 'Status: ⚠️ MEROKOK TERDETEKSI <span id="confidence" class="confidence"></span>';
+          speakAlert();
+        } else {
+          statusBox.className = 'status-box status-normal';
+          statusBox.innerHTML = 'Status: Normal <span id="confidence" class="confidence"></span>';
+        }
+        wasSmoking = data.smoking_detected;
+        const confEl = document.getElementById('confidence');
+        if (confEl) confEl.innerText = 'Confidence: ' + ((data.confidence || 0) * 100).toFixed(0) + '%';
+
+      } catch (e) {
+        console.error('Deteksi gagal:', e);
+      }
+
+      sending = false;
+      setTimeout(loopDetect, 700);
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    navigator.mediaDevices?.enumerateDevices().then(() => listCameras());
+  </script>
+</body>
+</html>
